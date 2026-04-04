@@ -35,7 +35,7 @@ Colonne usate:
 Le coordinate nel file sono in formato gradi/minuti/secondi (es. `41°54’`, `5°21’W`) e vengono convertite in gradi decimali.
 
 Di default il mainland americano viene rimosso dalla renderizzazione. Se vuoi visualizzarlo, usa `--show-americas`.
-Il profilo delle Isole Canarie viene sempre rafforzato con una traccia dedicata per mantenerle visibili.
+La mappa include layer dedicati per Canarie e Piccole Antille durante la transizione.
 
 ## Esecuzione
 
@@ -77,12 +77,13 @@ python3 run.py \
   - `Isole Canarie` e `Arrecife`: oltre al fattore longitudine, `lat' = lat - 15`.
   - `Thule Orientale (fittizia)`: nessun fattore longitudine, ma `lon' = lon + 48.5`.
 - Le terre emerse sono deformate con una Thin Plate Spline globale, calibrata sugli stessi punti di controllo.
-- Nel layer terre emerse viene aggiunto un profilo dedicato delle Canarie, utile anche dopo il crop e la deformazione.
+- Le Piccole Antille sono aggiunte alla mappa e durante la transizione migrano verso le longitudini delle Canarie.
+- Le Canarie iniziano a svanire poco prima della fine e sono completamente trasparenti all'ultimo frame.
 - I punti città vengono deformati con lo stesso identico campo elastico delle terre emerse (ancore esatte sui punti di controllo), cosi' restano solidali al terreno sottostante.
 - L'animazione interpola da identita (`t=0`) a trasformazione completa (`t=1`).
 - La vista viene croppata automaticamente sulla zona coperta dai punti iniziali/finali (dataset + punti aggiunti), con un piccolo margine.
 - `--slowdown-factor` rallenta l'evoluzione della trasformazione senza cambiare il modello geometrico.
-- `--end-hold-seconds` mantiene fermo il frame finale prima della chiusura dell'animazione.
+- `--end-hold-seconds` mantiene fermo il frame finale prima della chiusura dell'animazione (clamp automatico a massimo 15s).
 - `--max-labels` limita il numero di etichette visualizzate (`0` = nessuna etichetta).
 - Di default il mainland americano e' nascosto; usa `--show-americas` per riattivarlo.
 

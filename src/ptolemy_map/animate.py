@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import geodatasets
+from shapely import affinity
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 
@@ -22,6 +23,67 @@ ADDED_POINT_NAMES = {"Isole Canarie", "Arrecife", "Thule Orientale (fittizia)"}
 PRIORITY_CITY_NAMES = {"Gerusalemme", "Roma", "Atene", "Alessandria"}
 
 
+def _build_canary_islands() -> gpd.GeoDataFrame:
+    island_centers = [
+        (-17.92, 28.72),
+        (-17.23, 28.10),
+        (-18.01, 27.73),
+        (-16.57, 28.29),
+        (-15.60, 27.95),
+        (-14.01, 28.39),
+        (-13.64, 29.04),
+    ]
+    canary_polys = [Point(lon, lat).buffer(0.28, resolution=16) for lon, lat in island_centers]
+    return gpd.GeoDataFrame(geometry=canary_polys, crs="EPSG:4326")
+
+
+def _build_lesser_antilles_start() -> gpd.GeoDataFrame:
+    antilles_centers = [
+        (-61.80, 17.10),
+        (-61.40, 16.30),
+        (-61.00, 15.40),
+        (-60.98, 14.64),
+        (-60.98, 13.91),
+        (-61.20, 13.25),
+        (-61.68, 12.06),
+    ]
+    antilles_polys = [Point(lon, lat).buffer(0.22, resolution=16) for lon, lat in antilles_centers]
+    return gpd.GeoDataFrame(geometry=antilles_polys, crs="EPSG:4326")
+
+
+def _build_lesser_antilles_target(start: gpd.GeoDataFrame, canaries: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    start_bounds = start.geometry.bounds
+    canary_bounds = canaries.geometry.bounds
+
+    # Position Antilles so their eastern edge sits before Canaries' western edge.
+    # Add a 4° safety margin to prevent touching Africa as zoom restricts.
+    start_max_x = float(start_bounds["maxx"].max())
+    canary_min_x = float(canary_bounds["minx"].min())
+    safety_margin = 4.0
+    dx = (canary_min_x - safety_margin) - start_max_x
+
+    target_geoms = [affinity.translate(geom, xoff=dx, yoff=0.0) for geom in start.geometry]
+    return gpd.GeoDataFrame(geometry=target_geoms, crs="EPSG:4326")
+
+
+def _interpolate_geoseries(start: gpd.GeoSeries, end: gpd.GeoSeries, t: float) -> gpd.GeoSeries:
+    if len(start) != len(end):
+        raise ValueError("Start/end geometry series must have same length")
+    geoms = []
+    for g0, g1 in zip(start, end, strict=True):
+        c0 = g0.centroid
+        c1 = g1.centroid
+        geoms.append(affinity.translate(g0, xoff=(c1.x - c0.x) * t, yoff=(c1.y - c0.y) * t))
+    return gpd.GeoSeries(geoms, crs="EPSG:4326")
+
+
+def _canary_alpha(t: float) -> float:
+    fade_start = 0.82
+    if t <= fade_start:
+        return 1.0
+    return max(0.0, 1.0 - (t - fade_start) / (1.0 - fade_start))
+
+
 def _load_land() -> gpd.GeoDataFrame:
     land_path = geodatasets.get_path("naturalearth.land")
     land = gpd.read_file(land_path)
@@ -30,23 +92,6 @@ def _load_land() -> gpd.GeoDataFrame:
     else:
         land = land.to_crs("EPSG:4326")
     return land
-
-
-def _add_canary_profile(land: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Add an explicit Canary Islands profile to improve visibility in low-res land datasets."""
-    island_centers = [
-        (-17.92, 28.72),  # La Palma
-        (-17.23, 28.10),  # La Gomera
-        (-18.01, 27.73),  # El Hierro
-        (-16.57, 28.29),  # Tenerife
-        (-15.60, 27.95),  # Gran Canaria
-        (-14.01, 28.39),  # Fuerteventura
-        (-13.64, 29.04),  # Lanzarote
-    ]
-    # Degree-radius approximation only for visual contour enrichment.
-    canary_polys = [Point(lon, lat).buffer(0.28, resolution=16) for lon, lat in island_centers]
-    canary_gdf = gpd.GeoDataFrame(geometry=canary_polys, crs="EPSG:4326")
-    return pd.concat([land, canary_gdf], ignore_index=True)
 
 
 def _remove_americas_mainland(land: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -183,7 +228,13 @@ def _select_label_points(points: pd.DataFrame, max_labels: int) -> pd.DataFrame:
     return points.loc[selected_idx].copy()
 
 
-def _compute_view_bounds(points: pd.DataFrame, pad_lon: float = 4.0, pad_lat: float = 3.0) -> Tuple[float, float, float, float]:
+def _compute_view_bounds(
+    points: pd.DataFrame,
+    extra_lons: np.ndarray | None = None,
+    extra_lats: np.ndarray | None = None,
+    pad_lon: float = 4.0,
+    pad_lat: float = 3.0,
+) -> Tuple[float, float, float, float]:
     lon_all = np.concatenate(
         [
             points["lon"].to_numpy(dtype=float),
@@ -196,6 +247,10 @@ def _compute_view_bounds(points: pd.DataFrame, pad_lon: float = 4.0, pad_lat: fl
             points["target_lat"].to_numpy(dtype=float),
         ]
     )
+    if extra_lons is not None and len(extra_lons):
+        lon_all = np.concatenate([lon_all, extra_lons])
+    if extra_lats is not None and len(extra_lats):
+        lat_all = np.concatenate([lat_all, extra_lats])
 
     min_lon = float(np.min(lon_all)) - pad_lon
     max_lon = float(np.max(lon_all)) + pad_lon
@@ -265,6 +320,9 @@ def _land_to_svg_path(
 
 def _render_frame(
     land: gpd.GeoDataFrame,
+    canaries: gpd.GeoDataFrame,
+    antilles_start: gpd.GeoDataFrame,
+    antilles_target: gpd.GeoDataFrame,
     points: pd.DataFrame,
     label_points: pd.DataFrame,
     model: ElasticWarpModel,
@@ -272,6 +330,9 @@ def _render_frame(
     view_bounds: Tuple[float, float, float, float],
 ) -> np.ndarray:
     warped_land = land.geometry.apply(lambda geom: warp_geometry(geom, t=t, model=model))
+    warped_canaries = canaries.geometry.apply(lambda geom: warp_geometry(geom, t=t, model=model))
+    # Antilles travel east in real geographic space — no Ptolemaic warp applied.
+    antilles_now = _interpolate_geoseries(antilles_start.geometry, antilles_target.geometry, t=t)
 
     lon = points["lon"].to_numpy(dtype=float)
     lat = points["lat"].to_numpy(dtype=float)
@@ -282,9 +343,37 @@ def _render_frame(
     fig.patch.set_facecolor("#f9faf4")
 
     gpd.GeoSeries(warped_land, crs="EPSG:4326").boundary.plot(ax=ax, linewidth=0.65, color="#111111")
-    ax.scatter(warped_lon, warped_lat, s=34, color="#cc3d2f", edgecolors="#f9faf4", linewidths=0.6, zorder=5)
+    canary_a = _canary_alpha(t)
+    if canary_a > 0.0:
+        gpd.GeoSeries(warped_canaries, crs="EPSG:4326").boundary.plot(
+            ax=ax,
+            linewidth=0.9,
+            color="#111111",
+            alpha=canary_a,
+        )
+    gpd.GeoSeries(antilles_now, crs="EPSG:4326").boundary.plot(
+        ax=ax,
+        linewidth=0.9,
+        color="#111111",
+        alpha=min(1.0, 0.35 + 0.65 * t),
+    )
+    canary_city_mask = points["name"].isin(["Isole Canarie", "Arrecife"]).to_numpy()
+    if (~canary_city_mask).any():
+        ax.scatter(
+            warped_lon[~canary_city_mask], warped_lat[~canary_city_mask],
+            s=34, color="#cc3d2f", edgecolors="#f9faf4", linewidths=0.6, zorder=5,
+        )
+    if canary_city_mask.any() and canary_a > 0.0:
+        ax.scatter(
+            warped_lon[canary_city_mask], warped_lat[canary_city_mask],
+            s=34, color="#cc3d2f", edgecolors="#f9faf4", linewidths=0.6, zorder=5, alpha=canary_a,
+        )
 
     for _, row in label_points.iterrows():
+        is_canary_city = str(row["name"]) in {"Isole Canarie", "Arrecife"}
+        lbl_alpha = canary_a if is_canary_city else 1.0
+        if lbl_alpha <= 0.0:
+            continue
         label_lon_arr, label_lat_arr = warp_lon_lat(
             np.asarray([row["lon"]], dtype=float),
             np.asarray([row["lat"]], dtype=float),
@@ -300,6 +389,7 @@ def _render_frame(
             fontsize=8,
             color="#1f1f1f",
             family="DejaVu Sans",
+            alpha=lbl_alpha,
         )
 
     min_lon, max_lon, min_lat, max_lat = view_bounds
@@ -315,6 +405,104 @@ def _render_frame(
     return frame
 
 
+def _transform_final_image(
+    final_img: np.ndarray,
+    template_shape: tuple[int, int, int],
+    affine_a: float = 1.0,
+    affine_b: float = 0.0,
+    affine_c: float = 0.0,
+    affine_d: float = 1.0,
+    affine_tx: float = 0.0,
+    affine_ty: float = 0.0,
+) -> np.ndarray:
+    """Apply GIMP affine transformation on white background.
+    
+    Uses inverse matrix for PIL.Image.transform (backward mapping).
+    
+    Args:
+        final_img: Image array (H, W, C)
+        template_shape: Target canvas shape (height, width, channels)
+        affine_a, affine_b, affine_c, affine_d: 2x2 affine matrix elements
+        affine_tx, affine_ty: Translation vector
+    
+    Returns:
+        Transformed image on white background matching template_shape
+    """
+    from PIL import Image
+    import numpy as np
+    
+    # Convert to RGB if needed (before transform)
+    if final_img.ndim == 2:
+        # Grayscale -> RGB
+        final_img = np.stack([final_img] * 3, axis=-1)
+    elif final_img.ndim == 3 and final_img.shape[2] == 4:
+        # RGBA -> RGB
+        final_img = final_img[:, :, :3]
+    
+    # Convert to PIL Image
+    pil_img = Image.fromarray(final_img)
+    canvas_w, canvas_h = template_shape[1], template_shape[0]
+    
+    # PIL.Image.transform requires the INVERSE affine matrix (backward mapping)
+    # Our GIMP matrix is: [x'] = M * [x] + t (forward mapping)
+    # For PIL we need the inverse to map output coords back to source coords
+    
+    det = affine_a * affine_d - affine_b * affine_c
+    if abs(det) < 1e-10:
+        # Singular matrix, can't invert - return white canvas
+        output = np.full(template_shape, 255, dtype=np.uint8)
+        return output
+    
+    # Inverse of the 2x2 matrix
+    inv_a = affine_d / det
+    inv_b = -affine_b / det
+    inv_c = -affine_c / det
+    inv_d = affine_a / det
+    
+    # The GIMP matrix was measured with the source image already centered in canvas.
+    # Map output canvas coords -> source image coords:
+    # p_canvas = M^-1 * p_out - M^-1 * t
+    # p_src = p_canvas - p0, where p0 is top-left of centered source image in canvas.
+    img_h, img_w = final_img.shape[:2]
+    src_x0 = (canvas_w - img_w) / 2.0
+    src_y0 = (canvas_h - img_h) / 2.0
+
+    inv_tx = -(inv_a * affine_tx + inv_b * affine_ty) - src_x0
+    inv_ty = -(inv_c * affine_tx + inv_d * affine_ty) - src_y0
+    
+    # PIL.Image.transform: (a, b, c, d, e, f) represents:
+    # x_src = a*x_dst + b*y_dst + c
+    # y_src = d*x_dst + e*y_dst + f
+    pil_transform = (inv_a, inv_b, inv_tx, inv_c, inv_d, inv_ty)
+    
+    # Apply transformation with WHITE fillcolor for areas outside the image
+    transformed = pil_img.transform(
+        (canvas_w, canvas_h),
+        Image.AFFINE,
+        pil_transform,
+        Image.BILINEAR,
+        fillcolor=(255, 255, 255)  # White tuple for RGB
+    )
+    
+    # Convert to numpy array
+    result_arr = np.array(transformed)
+    
+    # Ensure output has correct shape and is RGB
+    if result_arr.ndim == 2:
+        result_arr = np.stack([result_arr] * 3, axis=-1)
+    elif result_arr.ndim == 3 and result_arr.shape[2] == 4:
+        result_arr = result_arr[:, :, :3]
+    
+    # Ensure matching template shape
+    if result_arr.shape[:2] != (template_shape[0], template_shape[1]):
+        output = np.full(template_shape, 255, dtype=np.uint8)
+        h, w = min(result_arr.shape[0], template_shape[0]), min(result_arr.shape[1], template_shape[1])
+        output[:h, :w] = result_arr[:h, :w]
+        return output
+    
+    return result_arr
+
+
 def render_animation(
     points_csv: Path,
     output_gif: Path,
@@ -322,17 +510,34 @@ def render_animation(
     frames: int = 80,
     fps: int = 20,
     slowdown_factor: float = 5.0,
+    start_hold_seconds: float = 0.0,
     end_hold_seconds: float = 1.5,
     loop: int = 1,
     max_labels: int = 18,
     hide_americas: bool = True,
+    final_image: Path | None = None,
+    final_image_duration: float = 10.0,
+    final_image_dissolve_seconds: float = 3.0,
+    final_image_affine_a: float = 1.0,
+    final_image_affine_b: float = 0.0,
+    final_image_affine_c: float = 0.0,
+    final_image_affine_d: float = 1.0,
+    final_image_affine_tx: float = 0.0,
+    final_image_affine_ty: float = 0.0,
+    export_final_frame: bool = False,
 ) -> None:
-    land = _add_canary_profile(_load_land())
+    land = _load_land()
     if hide_americas:
         land = _remove_americas_mainland(land)
+    canaries = _build_canary_islands()
+    antilles_start = _build_lesser_antilles_start()
+    antilles_target = _build_lesser_antilles_target(antilles_start, canaries)
     points = _compute_targets(_load_points(points_csv), params=params)
     label_points = _select_label_points(points, max_labels=max_labels)
-    view_bounds = _compute_view_bounds(points)
+    antilles_ref_lons = np.array([g.centroid.x for g in antilles_start.geometry])
+    antilles_ref_lats = np.array([g.centroid.y for g in antilles_start.geometry])
+    antilles_tgt_lons = np.array([g.centroid.x for g in antilles_target.geometry])
+    antilles_tgt_lats = np.array([g.centroid.y for g in antilles_target.geometry])
     model = build_elastic_model(
         control_lon=points["lon"].to_numpy(dtype=float),
         control_lat=points["lat"].to_numpy(dtype=float),
@@ -346,11 +551,18 @@ def render_animation(
     all_frames = []
     effective_frames = max(2, int(round(frames * max(slowdown_factor, 1.0))))
 
+    # Render main transition frames (t from 0 to 1)
     for idx in range(effective_frames):
         t = 0.0 if effective_frames <= 1 else idx / (effective_frames - 1)
+        cur_ant_lons = antilles_ref_lons + t * (antilles_tgt_lons - antilles_ref_lons)
+        cur_ant_lats = antilles_ref_lats + t * (antilles_tgt_lats - antilles_ref_lats)
+        view_bounds = _compute_view_bounds(points, extra_lons=cur_ant_lons, extra_lats=cur_ant_lats)
         all_frames.append(
             _render_frame(
                 land,
+                canaries,
+                antilles_start,
+                antilles_target,
                 points,
                 label_points=label_points,
                 model=model,
@@ -359,141 +571,239 @@ def render_animation(
             )
         )
 
+    # Add start hold frames
+    start_hold_count = max(0, int(round(start_hold_seconds * fps)))
+    if start_hold_count > 0:
+        all_frames = [all_frames[0]] * start_hold_count + all_frames
+
+    # Add end hold frames
+    end_hold_seconds = min(end_hold_seconds, 15.0)
     hold_count = max(0, int(round(end_hold_seconds * fps)))
     if hold_count > 0:
         all_frames.extend([all_frames[-1]] * hold_count)
 
-    imageio.mimsave(output_gif, all_frames, fps=fps, loop=loop)
+    # Export final animation frame as reference if requested
+    if export_final_frame:
+        from PIL import Image
+        ref_output = output_gif.parent / "final_frame_reference.png"
+        Image.fromarray(all_frames[-1]).save(ref_output)
+        print(f"Final frame reference saved to: {ref_output}")
+
+    # Add final image with dissolve if provided
+    if final_image is not None and Path(final_image).exists():
+        final_img = imageio.imread(final_image)
+        template_frame = all_frames[-1]
+        
+        # Convert RGBA to RGB if needed
+        if final_img.ndim == 3 and final_img.shape[2] == 4:
+            final_img = final_img[:, :, :3]
+        elif final_img.ndim == 2:
+            final_img = np.stack([final_img] * 3, axis=-1)
+        
+        # Transform image using affine matrix and place on white background
+        final_img = _transform_final_image(
+            final_img,
+            template_shape=template_frame.shape,
+            affine_a=final_image_affine_a,
+            affine_b=final_image_affine_b,
+            affine_c=final_image_affine_c,
+            affine_d=final_image_affine_d,
+            affine_tx=final_image_affine_tx,
+            affine_ty=final_image_affine_ty,
+        )
+        
+        # Create dissolve frames between final animation frame and final image.
+        dissolve_frames = max(2, int(round(max(0.0, final_image_dissolve_seconds) * fps)))
+        for idx in range(dissolve_frames):
+            alpha = idx / (dissolve_frames - 1)
+            frame = (template_frame * (1 - alpha) + final_img.astype(template_frame.dtype) * alpha).astype(np.uint8)
+            all_frames.append(frame)
+        
+        # Add final image hold frames
+        final_hold_count = max(0, int(round(final_image_duration * fps)))
+        if final_hold_count > 0:
+            all_frames.extend([final_img.astype(np.uint8)] * final_hold_count)
+
+    # Save with appropriate parameters for format
+    save_kwargs = {"fps": fps}
+    if output_gif.suffix.lower() == ".gif":
+        save_kwargs["loop"] = loop
+    imageio.mimsave(output_gif, all_frames, **save_kwargs)
 
 
 def render_svg_animation(
-        points_csv: Path,
-        output_svg: Path,
-        params: WarpParams,
-        frames: int = 80,
-        fps: int = 20,
-        slowdown_factor: float = 5.0,
-        end_hold_seconds: float = 1.5,
-        loop: int = 1,
-        max_labels: int = 18,
-        hide_americas: bool = True,
-        width: int = 1200,
-        height: int = 700,
+    points_csv: Path,
+    output_svg: Path,
+    params: WarpParams,
+    frames: int = 80,
+    fps: int = 20,
+    slowdown_factor: float = 5.0,
+    end_hold_seconds: float = 1.5,
+    loop: int = 1,
+    max_labels: int = 18,
+    hide_americas: bool = True,
+    width: int = 1200,
+    height: int = 700,
 ) -> None:
-        land = _add_canary_profile(_load_land())
-        if hide_americas:
-                land = _remove_americas_mainland(land)
+    land = _load_land()
+    if hide_americas:
+        land = _remove_americas_mainland(land)
+    canaries = _build_canary_islands()
+    antilles_start = _build_lesser_antilles_start()
+    antilles_target = _build_lesser_antilles_target(antilles_start, canaries)
 
-        points = _compute_targets(_load_points(points_csv), params=params)
-        label_points = _select_label_points(points, max_labels=max_labels)
-        view_bounds = _compute_view_bounds(points)
-        model = build_elastic_model(
-                control_lon=points["lon"].to_numpy(dtype=float),
-                control_lat=points["lat"].to_numpy(dtype=float),
-                target_lon=points["target_lon"].to_numpy(dtype=float),
-                target_lat=points["target_lat"].to_numpy(dtype=float),
-                params=params,
+    points = _compute_targets(_load_points(points_csv), params=params)
+    label_points = _select_label_points(points, max_labels=max_labels)
+    antilles_ref_lons = np.array([g.centroid.x for g in antilles_start.geometry])
+    antilles_ref_lats = np.array([g.centroid.y for g in antilles_start.geometry])
+    antilles_tgt_lons = np.array([g.centroid.x for g in antilles_target.geometry])
+    antilles_tgt_lats = np.array([g.centroid.y for g in antilles_target.geometry])
+    svg_canary_city_mask = points["name"].isin(["Isole Canarie", "Arrecife"]).to_numpy()
+    model = build_elastic_model(
+        control_lon=points["lon"].to_numpy(dtype=float),
+        control_lat=points["lat"].to_numpy(dtype=float),
+        target_lon=points["target_lon"].to_numpy(dtype=float),
+        target_lat=points["target_lat"].to_numpy(dtype=float),
+        params=params,
+    )
+
+    effective_frames = max(2, int(round(frames * max(slowdown_factor, 1.0))))
+    end_hold_seconds = min(end_hold_seconds, 15.0)
+    hold_count = max(0, int(round(end_hold_seconds * fps)))
+    total_frames = effective_frames + hold_count
+
+    layer_frames: list[dict[str, object]] = []
+    points_frames: list[list[dict[str, float]]] = []
+    labels_frames: list[list[dict[str, str]]] = []
+
+    for idx in range(effective_frames):
+        t = 0.0 if effective_frames <= 1 else idx / (effective_frames - 1)
+        cur_ant_lons = antilles_ref_lons + t * (antilles_tgt_lons - antilles_ref_lons)
+        cur_ant_lats = antilles_ref_lats + t * (antilles_tgt_lats - antilles_ref_lats)
+        view_bounds = _compute_view_bounds(points, extra_lons=cur_ant_lons, extra_lats=cur_ant_lats)
+        svg_canary_a = _canary_alpha(t)
+
+        warped_land = land.geometry.apply(lambda geom: warp_geometry(geom, t=t, model=model))
+        warped_canaries = canaries.geometry.apply(lambda geom: warp_geometry(geom, t=t, model=model))
+        # Antilles travel east in real geographic space — no Ptolemaic warp applied.
+        antilles_now = _interpolate_geoseries(antilles_start.geometry, antilles_target.geometry, t=t)
+
+        layer_frames.append(
+            {
+                "land": _land_to_svg_path(gpd.GeoSeries(warped_land, crs="EPSG:4326"), view_bounds, width, height),
+                "canary": _land_to_svg_path(gpd.GeoSeries(warped_canaries, crs="EPSG:4326"), view_bounds, width, height),
+                "antilles": _land_to_svg_path(gpd.GeoSeries(antilles_now, crs="EPSG:4326"), view_bounds, width, height),
+                "canaryAlpha": svg_canary_a,
+                "antillesAlpha": min(1.0, 0.35 + 0.65 * t),
+            }
         )
 
-        effective_frames = max(2, int(round(frames * max(slowdown_factor, 1.0))))
-        hold_count = max(0, int(round(end_hold_seconds * fps)))
-        total_frames = effective_frames + hold_count
+        lon = points["lon"].to_numpy(dtype=float)
+        lat = points["lat"].to_numpy(dtype=float)
+        warped_lon, warped_lat = warp_lon_lat(lon, lat, t=t, model=model)
+        px, py = _project_xy(warped_lon, warped_lat, view_bounds=view_bounds, width=width, height=height)
+        points_frames.append([
+            {"x": float(px[i]), "y": float(py[i]), "a": float(svg_canary_a if svg_canary_city_mask[i] else 1.0)}
+            for i in range(len(px))
+        ])
 
-        land_paths: list[str] = []
-        points_frames: list[list[dict[str, float]]] = []
-        labels_frames: list[list[dict[str, str]]] = []
+        frame_labels: list[dict[str, object]] = []
+        for _, row in label_points.iterrows():
+            is_canary_city = str(row["name"]) in {"Isole Canarie", "Arrecife"}
+            lbl_alpha = svg_canary_a if is_canary_city else 1.0
+            if lbl_alpha <= 0.0:
+                continue
+            llon, llat = warp_lon_lat(
+                np.asarray([row["lon"]], dtype=float),
+                np.asarray([row["lat"]], dtype=float),
+                t=t,
+                model=model,
+            )
+            lx, ly = _project_xy(llon, llat, view_bounds=view_bounds, width=width, height=height)
+            frame_labels.append(
+                {
+                    "x": f"{float(lx[0] + 8.0):.2f}",
+                    "y": f"{float(ly[0] - 8.0):.2f}",
+                    "text": html.escape(str(row["name"])),
+                    "a": lbl_alpha,
+                }
+            )
+        labels_frames.append(frame_labels)
 
-        for idx in range(effective_frames):
-                t = 0.0 if effective_frames <= 1 else idx / (effective_frames - 1)
-                warped_land = land.geometry.apply(lambda geom: warp_geometry(geom, t=t, model=model))
-                land_paths.append(_land_to_svg_path(gpd.GeoSeries(warped_land, crs="EPSG:4326"), view_bounds, width, height))
+    if hold_count > 0:
+        layer_frames.extend([layer_frames[-1]] * hold_count)
+        points_frames.extend([points_frames[-1]] * hold_count)
+        labels_frames.extend([labels_frames[-1]] * hold_count)
 
-                lon = points["lon"].to_numpy(dtype=float)
-                lat = points["lat"].to_numpy(dtype=float)
-                warped_lon, warped_lat = warp_lon_lat(lon, lat, t=t, model=model)
-                px, py = _project_xy(warped_lon, warped_lat, view_bounds=view_bounds, width=width, height=height)
-                points_frames.append([{"x": float(px[i]), "y": float(py[i])} for i in range(len(px))])
+    output_svg.parent.mkdir(parents=True, exist_ok=True)
 
-                frame_labels: list[dict[str, str]] = []
-                for _, row in label_points.iterrows():
-                        llon, llat = warp_lon_lat(
-                                np.asarray([row["lon"]], dtype=float),
-                                np.asarray([row["lat"]], dtype=float),
-                                t=t,
-                                model=model,
-                        )
-                        lx, ly = _project_xy(llon, llat, view_bounds=view_bounds, width=width, height=height)
-                        frame_labels.append(
-                                {
-                                        "x": f"{float(lx[0] + 8.0):.2f}",
-                                        "y": f"{float(ly[0] - 8.0):.2f}",
-                                        "text": html.escape(str(row["name"])),
-                                }
-                        )
-                labels_frames.append(frame_labels)
+    initial_points_svg = "\n".join(
+        f'<circle cx="{p["x"]:.2f}" cy="{p["y"]:.2f}" r="3.2" opacity="{float(p.get("a", 1.0)):.3f}"/>'
+        for p in points_frames[0]
+    )
+    initial_labels_svg = "\n".join(
+        f'<text x="{lbl["x"]}" y="{lbl["y"]}" opacity="{float(lbl.get("a", 1.0)):.3f}">{lbl["text"]}</text>'
+        for lbl in labels_frames[0]
+        if float(lbl.get("a", 1.0)) > 0
+    )
 
-        if hold_count > 0:
-                land_paths.extend([land_paths[-1]] * hold_count)
-                points_frames.extend([points_frames[-1]] * hold_count)
-                labels_frames.extend([labels_frames[-1]] * hold_count)
-
-        output_svg.parent.mkdir(parents=True, exist_ok=True)
-
-        initial_points_svg = "\n".join(
-                f'<circle cx="{p["x"]:.2f}" cy="{p["y"]:.2f}" r="3.2" />' for p in points_frames[0]
-        )
-        initial_labels_svg = "\n".join(
-                f'<text x="{lbl["x"]}" y="{lbl["y"]}">{lbl["text"]}</text>' for lbl in labels_frames[0]
-        )
-
-        svg = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+    svg = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width} {height}\" width=\"{width}\" height=\"{height}\">
-    <rect x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\" fill=\"#f9faf4\"/>
-    <path id=\"land\" d=\"{land_paths[0]}\" fill=\"none\" stroke=\"#111111\" stroke-width=\"1.1\"/>
-    <g id=\"points\" fill=\"#cc3d2f\" stroke=\"#f9faf4\" stroke-width=\"0.8\">{initial_points_svg}</g>
-    <g id=\"labels\" fill=\"#1f1f1f\" font-size=\"12\" font-family=\"DejaVu Sans\">{initial_labels_svg}</g>
-    <script><![CDATA[
-        const frameDuration = {int(round(1000 / max(fps, 1)))};
-        const totalFrames = {total_frames};
-        const loopCount = {loop};
-        const landPaths = {json.dumps(land_paths)};
-        const pointsFrames = {json.dumps(points_frames)};
-        const labelsFrames = {json.dumps(labels_frames)};
+  <rect x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\" fill=\"#f9faf4\"/>
+  <path id=\"land\" d=\"\" fill=\"none\" stroke=\"#111111\" stroke-width=\"1.1\"/>
+  <path id=\"canary\" d=\"\" fill=\"none\" stroke=\"#111111\" stroke-width=\"1.3\"/>
+  <path id=\"antilles\" d=\"\" fill=\"none\" stroke=\"#111111\" stroke-width=\"1.3\"/>
+  <g id=\"points\" fill=\"#cc3d2f\" stroke=\"#f9faf4\" stroke-width=\"0.8\">{initial_points_svg}</g>
+  <g id=\"labels\" fill=\"#1f1f1f\" font-size=\"12\" font-family=\"DejaVu Sans\">{initial_labels_svg}</g>
+  <script><![CDATA[
+    const frameDuration = {int(round(1000 / max(fps, 1)))};
+    const totalFrames = {total_frames};
+    const loopCount = {loop};
+    const layerFrames = {json.dumps(layer_frames)};
+    const pointsFrames = {json.dumps(points_frames)};
+    const labelsFrames = {json.dumps(labels_frames)};
 
-        const landNode = document.getElementById('land');
-        const pointsNode = document.getElementById('points');
-        const labelsNode = document.getElementById('labels');
+    const landNode = document.getElementById('land');
+    const canaryNode = document.getElementById('canary');
+    const antillesNode = document.getElementById('antilles');
+    const pointsNode = document.getElementById('points');
+    const labelsNode = document.getElementById('labels');
 
-        let frame = 0;
-        let played = 0;
+    let frame = 0;
+    let played = 0;
 
-        function renderFrame(idx) {{
-            landNode.setAttribute('d', landPaths[idx]);
-            pointsNode.innerHTML = pointsFrames[idx].map(p =>
-                `<circle cx="${{p.x.toFixed(2)}}" cy="${{p.y.toFixed(2)}}" r="3.2" />`
-            ).join('');
-            labelsNode.innerHTML = labelsFrames[idx].map(l =>
-                `<text x="${{l.x}}" y="${{l.y}}">${{l.text}}</text>`
-            ).join('');
+    function renderFrame(idx) {{
+      const layer = layerFrames[idx];
+      landNode.setAttribute('d', layer.land);
+      canaryNode.setAttribute('d', layer.canary);
+      antillesNode.setAttribute('d', layer.antilles);
+      canaryNode.setAttribute('opacity', layer.canaryAlpha.toFixed(4));
+      antillesNode.setAttribute('opacity', layer.antillesAlpha.toFixed(4));
+      pointsNode.innerHTML = pointsFrames[idx].map(p =>
+        `<circle cx="${{p.x.toFixed(2)}}" cy="${{p.y.toFixed(2)}}" r="3.2" opacity="${{(p.a??1).toFixed(3)}}"/>`
+      ).join('');
+      labelsNode.innerHTML = labelsFrames[idx].filter(l => (l.a??1) > 0).map(l =>
+        `<text x="${{l.x}}" y="${{l.y}}" opacity="${{(l.a??1).toFixed(3)}}">${{l.text}}</text>`
+      ).join('');
+    }}
+
+    renderFrame(0);
+    const timer = setInterval(() => {{
+      frame += 1;
+      if (frame >= totalFrames) {{
+        played += 1;
+        if (loopCount === 0 || played < loopCount) {{
+          frame = 0;
+        }} else {{
+          frame = totalFrames - 1;
+          renderFrame(frame);
+          clearInterval(timer);
+          return;
         }}
-
-        renderFrame(0);
-        const timer = setInterval(() => {{
-            frame += 1;
-            if (frame >= totalFrames) {{
-                played += 1;
-                if (loopCount === 0 || played < loopCount) {{
-                    frame = 0;
-                }} else {{
-                    frame = totalFrames - 1;
-                    renderFrame(frame);
-                    clearInterval(timer);
-                    return;
-                }}
-            }}
-            renderFrame(frame);
-        }}, frameDuration);
-    ]]></script>
+      }}
+      renderFrame(frame);
+    }}, frameDuration);
+  ]]></script>
 </svg>
 """
-        output_svg.write_text(svg, encoding="utf-8")
+    output_svg.write_text(svg, encoding="utf-8")
